@@ -52,7 +52,12 @@ class _PantallaMapaState extends State<PantallaMapa> {
   Future<void>? _arranque;
   StreamSubscription? _subBrujula;
   StreamSubscription<Position>? _subTrack;
+  StreamSubscription<Position>? _subPosicion;
+  StreamSubscription<MapPosition>? _subZoomMapa;
   final List<TrackPunto> _puntosTrack = [];
+  LatLong? _miPosicion;
+  double? _miRumbo;
+  int? _zoomVisual;
   ModoOrientacion _orientacion = ModoOrientacion.libre;
   AjusteFitZoom _ajusteFitZoom = AjusteFitZoom.normal;
   bool _importando = false;
@@ -68,6 +73,8 @@ class _PantallaMapaState extends State<PantallaMapa> {
   void dispose() {
     _subBrujula?.cancel();
     _subTrack?.cancel();
+    _subPosicion?.cancel();
+    _subZoomMapa?.cancel();
     _mapModel?.dispose();
     super.dispose();
   }
@@ -75,10 +82,23 @@ class _PantallaMapaState extends State<PantallaMapa> {
   // -------------------------------------------------------------- arranque
 
   Future<void> _iniciar() async {
+    try {
+      await _iniciarInterno();
+    } catch (e, st) {
+      // Antes un error aquí quedaba silencioso y la app se quedaba en el spinner.
+      debugPrint('OffMaps ERROR al iniciar: $e\n$st');
+      if (mounted) {
+        setState(() => _aviso = 'Error cargando el mapa:\n$e');
+      }
+    }
+  }
+
+  Future<void> _iniciarInterno() async {
     await _cargarAjusteFitZoom();
     _canal.setMethodCallHandler(_enLlamadaNativa);
 
     final permiso = await _canal.invokeMethod<bool>('permisoAlmacenamiento');
+    debugPrint('OffMaps [1] permiso almacenamiento: $permiso');
     if (permiso != true) {
       setState(() => _aviso =
           'Concede "Todos los archivos" a OffMaps y vuelve a abrir la app.');
@@ -87,6 +107,7 @@ class _PantallaMapaState extends State<PantallaMapa> {
     final mapas = (await _canal.invokeMethod<List<dynamic>>('listarMapas'))
             ?.cast<String>() ??
         const <String>[];
+    debugPrint('OffMaps [2] mapas encontrados: $mapas');
     if (mapas.isEmpty) {
       setState(() => _aviso =
           'Copia un mapa .map (alternativaslibres) en la carpeta OffMaps del almacenamiento.');
@@ -94,6 +115,23 @@ class _PantallaMapaState extends State<PantallaMapa> {
     }
     final archivo = mapas.length == 1 ? mapas.first : await _elegir(mapas);
     if (archivo == null) return;
+    if (!mounted) return;
+
+    final f = File(archivo);
+    debugPrint('OffMaps [3] archivo: $archivo existe=${await f.exists()} '
+        'bytes=${await f.exists() ? await f.length() : 0}');
+
+    // Diagnóstico de assets del tema: la declaración "assets/render_theme/"
+    // del pubspec NO incluye subcarpetas (symbols, patterns...).
+    final manifiesto = await AssetManifest.loadFromAssetBundle(rootBundle);
+    final assetsTema = manifiesto
+        .listAssets()
+        .where((a) => a.startsWith('assets/render_theme/'))
+        .toList();
+    final carpetas = assetsTema
+        .map((a) => a.split('/').sublist(0, a.split('/').length - 1).join('/'))
+        .toSet();
+    debugPrint('OffMaps [4] assets del tema: ${assetsTema.length} en $carpetas');
     if (!mounted) return;
 
     MapsforgeSettingsMgr()
@@ -105,19 +143,31 @@ class _PantallaMapaState extends State<PantallaMapa> {
         pathPrefix: 'assets/render_theme/',
       ),
     );
-    final datastore = await IsolateMapfile.createFromFile(filename: archivo);
+    final datastore = await Mapfile.createFromFile(filename: archivo);
+    debugPrint('OffMaps [5] datastore creado');
     final tema = await rootBundle.loadString(temaAsset);
+    debugPrint('OffMaps [6] tema cargado: ${tema.length} caracteres');
     final rendertheme = RenderThemeBuilder.createFromString(tema);
+    // Con Mapfile (no IsolateMapfile) habilitamos lectura/render en isolate
+    // para mejorar rendimiento en zooms con mucha carga visual.
     final renderer = DatastoreRenderer(datastore, rendertheme, useIsolateReader: true);
 
     final modelo = MapModel(renderer: renderer, zoomlevelRange: const ZoomlevelRange(0, 21));
     final caja = await datastore.getBoundingBox();
     final centroLat = (caja.minLatitude + caja.maxLatitude) / 2;
     final centroLon = (caja.minLongitude + caja.maxLongitude) / 2;
-    debugPrint('OffMaps: $archivo cubre lat ${caja.minLatitude}..${caja.maxLatitude}, '
+    debugPrint('OffMaps [7] $archivo cubre lat ${caja.minLatitude}..${caja.maxLatitude}, '
         'lon ${caja.minLongitude}..${caja.maxLongitude}');
     modelo.setPosition(MapPosition(centroLat, centroLon, 11));
     _mapModel = modelo;
+    _zoomVisual = modelo.lastPosition?.zoomlevel;
+
+    await _subZoomMapa?.cancel();
+    _subZoomMapa = modelo.positionStream.listen((p) {
+      if (!mounted) return;
+      if (_zoomVisual == p.zoomlevel) return;
+      setState(() => _zoomVisual = p.zoomlevel);
+    });
 
     // Pulsación prolongada = crear punto
     modelo.longTapStream.listen((ev) {
@@ -129,7 +179,40 @@ class _PantallaMapaState extends State<PantallaMapa> {
         await _canal.invokeMethod<Map<dynamic, dynamic>>('obtenerPendiente');
     if (pendiente != null) _recibirCoordenada(pendiente);
 
+    debugPrint('OffMaps [8] modelo listo');
+    unawaited(_iniciarIndicadorPosicion());
     setState(() {});
+  }
+
+  Future<void> _iniciarIndicadorPosicion() async {
+    if (!mounted) return;
+    final ok = await Geolocator.isLocationServiceEnabled();
+    if (!ok) return;
+
+    var perm = await Geolocator.checkPermission();
+    if (perm == LocationPermission.denied) {
+      perm = await Geolocator.requestPermission();
+    }
+    if (perm == LocationPermission.denied || perm == LocationPermission.deniedForever) {
+      return;
+    }
+
+    await _subPosicion?.cancel();
+    _subPosicion = Geolocator.getPositionStream(
+      locationSettings: const LocationSettings(
+        accuracy: LocationAccuracy.high,
+        distanceFilter: 2,
+      ),
+    ).listen((p) {
+      if (!mounted) return;
+      final rumbo = p.heading;
+      setState(() {
+        _miPosicion = LatLong(p.latitude, p.longitude);
+        if (rumbo.isFinite && rumbo >= 0) {
+          _miRumbo = rumbo;
+        }
+      });
+    });
   }
 
   Future<String?> _elegir(List<String> mapas) => showDialog<String>(
@@ -166,6 +249,12 @@ class _PantallaMapaState extends State<PantallaMapa> {
   Future<void> _centrarGps() async {
     final pos = await _posicionActual();
     if (pos == null) return;
+    setState(() {
+      _miPosicion = LatLong(pos.latitude, pos.longitude);
+      if (pos.heading.isFinite && pos.heading >= 0) {
+        _miRumbo = pos.heading;
+      }
+    });
     _mapModel?.zoomToAround(pos.latitude, pos.longitude, 16);
   }
 
@@ -811,6 +900,7 @@ class _PantallaMapaState extends State<PantallaMapa> {
   @override
   Widget build(BuildContext context) {
     final modelo = _mapModel;
+    final zoomActual = _zoomVisual ?? modelo?.lastPosition?.zoomlevel ?? zoomInicial;
     return Scaffold(
       body: _aviso != null
           ? _pantallaAviso()
@@ -824,14 +914,15 @@ class _PantallaMapaState extends State<PantallaMapa> {
                       GenericGestureDetector(mapModel: modelo),
                       ...modelo.renderers
                           .map((r) => TileView(mapModel: modelo, renderer: r)),
-                      ...modelo.labelRenderers
-                          .map((r) => LabelView(mapModel: modelo, renderer: r)),
+                      if (zoomActual >= 15)
+                        ...modelo.labelRenderers
+                            .map((r) => LabelView(mapModel: modelo, renderer: r)),
                       MarkerDatastoreOverlay(
                         mapModel: modelo,
                         datastore: _construirMarcadores(),
                         zoomlevelRange: ZoomlevelRange.standard(),
                       ),
-                      DistanceOverlay(mapModel: modelo),
+                      if (zoomActual >= 13) DistanceOverlay(mapModel: modelo),
                       _badgeTrack(),
                       _panelInferior(),
                       _botonesLaterales(modelo),
@@ -865,6 +956,29 @@ class _PantallaMapaState extends State<PantallaMapa> {
 
   MarkerDatastore _construirMarcadores() {
     final ds = DefaultMarkerDatastore();
+    final zoom = _zoomVisual ?? _mapModel?.lastPosition?.zoomlevel ?? zoomInicial;
+
+    if (_miPosicion != null) {
+      final p = _miPosicion!;
+      ds.addMarker(CircleMarker(
+        latLong: p,
+        radius: _radioPunto(zoom, base: 2.2, maximo: 4.2),
+        fillColor: 0xFF1E88E5,
+        strokeColor: 0xFFFFFFFF,
+        strokeWidth: 1.2,
+      ));
+
+      final rumbo = _miRumbo;
+      if (rumbo != null) {
+        ds.addMarker(IconMarker(
+          latLong: p,
+          iconData: Icons.navigation_rounded,
+          rotation: rumbo,
+          size: _tamIconoRumbo(zoom),
+          bitmapColor: 0xFF0D47A1,
+        ));
+      }
+    }
 
     for (final linea in estado.lineasExternasVisibles) {
       if (linea.length < 2) continue;
@@ -891,12 +1005,16 @@ class _PantallaMapaState extends State<PantallaMapa> {
       final esFin = i == estado.puntos.length - 1 && estado.puntos.length > 1;
       ds.addMarker(CircleMarker(
         latLong: LatLong(p.lat, p.lon),
-        radius: 10,
+        radius: _radioPunto(
+          zoom,
+          base: esInicio || esFin ? 1.8 : 1.6,
+          maximo: esInicio || esFin ? 3.2 : 2.8,
+        ),
         fillColor: esInicio
-            ? 0x880B7A3E
-            : (esFin ? 0x88CC2200 : 0x880066CC),
-        strokeColor: 0xFF000000,
-        strokeWidth: 2,
+            ? 0xCC0B7A3E
+            : (esFin ? 0xCCB00020 : 0xCC1565C0),
+        strokeColor: 0xFFFFFFFF,
+        strokeWidth: 1,
       ));
     }
     if (estado.trazo.length > 1) {
@@ -914,6 +1032,19 @@ class _PantallaMapaState extends State<PantallaMapa> {
       ));
     }
     return ds;
+  }
+
+  double _radioPunto(int zoom, {required double base, required double maximo}) {
+    final t = ((15 - zoom) / 8).clamp(0.0, 1.0);
+    return base + (maximo - base) * t;
+  }
+
+  double _tamIconoRumbo(int zoom) {
+    if (zoom >= 19) return 10;
+    if (zoom >= 17) return 12;
+    if (zoom >= 15) return 14;
+    if (zoom >= 13) return 16;
+    return 18;
   }
 
   Widget _botonesLaterales(MapModel modelo) => Positioned(
