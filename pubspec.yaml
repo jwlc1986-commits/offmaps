@@ -33,3 +33,23 @@ flutter:
   uses-material-design: true
   assets:
     - assets/render_theme/
+    - assets/render_theme/patterns/
+    - assets/render_theme/symbols/
+    - assets/render_theme/symbols/accommodation/
+    - assets/render_theme/symbols/amenity/
+    - assets/render_theme/symbols/barrier/
+    - assets/render_theme/symbols/custom/
+    - assets/render_theme/symbols/custom/amenity/
+    - assets/render_theme/symbols/custom/money/
+    - assets/render_theme/symbols/custom/tourist/
+    - assets/render_theme/symbols/education/
+    - assets/render_theme/symbols/food/
+    - assets/render_theme/symbols/health/
+    - assets/render_theme/symbols/money/
+    - assets/render_theme/symbols/place_of_worship/
+    - assets/render_theme/symbols/poi/
+    - assets/render_theme/symbols/shopping/
+    - assets/render_theme/symbols/sport/
+    - assets/render_theme/symbols/tourist/
+    - assets/render_theme/symbols/transport/
+    - assets/render_theme/symbols/water/

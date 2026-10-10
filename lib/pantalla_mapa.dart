@@ -18,9 +18,9 @@ import 'package:mapsforge_flutter_renderer/offline_renderer.dart';
 import 'package:mapsforge_flutter_rendertheme/rendertheme.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:share_plus/share_plus.dart';
-import 'package:url_launcher/url_launcher.dart';
 
 import 'estado_mapa.dart';
+import 'renderer_medido.dart';
 import 'servicio_brouter.dart';
 import 'servicio_importacion.dart';
 import 'servicio_tracks.dart';
@@ -30,9 +30,42 @@ const latInicial = 4.6483;   // Bogotá; cámbiala si quieres otra posición ini
 const lonInicial = -74.0661;
 const zoomInicial = 12;
 
+/// Zoom mínimo permitido (0 = sin límite). Hipótesis: en zooms bajos cada tile abarca una
+/// zona enorme del mapa de toda Colombia y es lo más lento de dibujar. Compruébalo con los
+/// logs "OffMaps TILES z=..." y ajusta este valor.
+const zoomMinimo = 8;
+
+/// Diagnóstico (logs "OffMaps ..." y medición de tiles).
+/// Para priorizar rendimiento, queda apagado por defecto también en debug.
+/// Si quieres activarlo temporalmente: --dart-define=DIAGNOSTICO=true
+const diagnostico = bool.fromEnvironment('DIAGNOSTICO', defaultValue: false);
+
+void _diag(String mensaje) {
+  if (diagnostico) debugPrint(mensaje);
+}
+
+/// Factor de escala máximo que se le da a mapsforge (0 = usar la densidad real de la pantalla).
+/// mapsforge pide una cantidad de tiles que crece con el CUADRADO de este factor: con el
+/// Motorola (2.81) pide 324 tiles por pantalla; con 1.5 serían unos 110; con 1.0, unos 45.
+/// A cambio, el mapa se ve menos nítido y los elementos (texto, marcadores) más grandes.
+/// Valor de prueba para priorizar fluidez.
+/// 1.0 = más rápido (menos nitidez). 1.5/2.0 = más nítido (más lento).
+const escalaMapaMaxima = 1.0;
+
+/// true  = el punto de pulsación larga se calcula con la posición del mapa en el instante
+///         en que pones el dedo (así lo hace la librería).
+/// false = con la posición del mapa cuando se cumple la pulsación (350 ms después).
+const puntoConPosicionAlTocar = true;
+
 enum ModoOrientacion { libre, norte, magnetico }
 
 enum AjusteFitZoom { cercano, normal, amplio }
+
+class _PerfilRuta {
+  final String id;
+  final String nombre;
+  const _PerfilRuta(this.id, this.nombre);
+}
 
 class PantallaMapa extends StatefulWidget {
   const PantallaMapa({super.key});
@@ -42,6 +75,17 @@ class PantallaMapa extends StatefulWidget {
 
 class _PantallaMapaState extends State<PantallaMapa> {
   static const _prefAjusteFitZoom = 'ajuste_fit_zoom';
+  static const _prefEscalaPuntos = 'ui_escala_puntos';
+  static const _prefEscalaPosicion = 'ui_escala_posicion';
+  static const _prefGrosorRuta = 'ui_grosor_ruta';
+  static const _prefGrosorTrack = 'ui_grosor_track';
+  static const _prefMostrarEtiquetas = 'ui_mostrar_etiquetas';
+  static const _prefPerfilRuta = 'ui_perfil_ruta';
+  static const _perfilesRuta = <_PerfilRuta>[
+    _PerfilRuta('car-fast', 'Vehículo'),
+    _PerfilRuta('fastbike', 'Bicicleta'),
+    _PerfilRuta('trekking', 'Peatonal'),
+  ];
   final estado = EstadoMapa();
   final brouter = ServicioBrouter();
   final importador = ServicioImportacion();
@@ -54,12 +98,27 @@ class _PantallaMapaState extends State<PantallaMapa> {
   StreamSubscription<Position>? _subTrack;
   StreamSubscription<Position>? _subPosicion;
   StreamSubscription<MapPosition>? _subZoomMapa;
+  StreamSubscription<TapEvent?>? _subTapMapa;
   final List<TrackPunto> _puntosTrack = [];
   LatLong? _miPosicion;
   double? _miRumbo;
   int? _zoomVisual;
   ModoOrientacion _orientacion = ModoOrientacion.libre;
   AjusteFitZoom _ajusteFitZoom = AjusteFitZoom.normal;
+  double _escalaPuntos = 1.0;
+  double _escalaPosicion = 6.0;
+  double _grosorRuta = 2.2;
+  double _grosorTrack = 2.4;
+  bool _mostrarEtiquetas = true;
+  String _perfilRuta = 'trekking';
+  bool _panelRutaAbierto = false;
+  int _punterosActivos = 0;
+  MapPosition? _posAlTocar;
+  Offset? _offsetAlTocar;
+  Timer? _temporizadorLongPress;
+  int? _punteroLongPress;
+  Offset? _inicioLongPress;
+  bool _multitouchEnCurso = false;
   bool _importando = false;
   String? _aviso;
 
@@ -75,6 +134,8 @@ class _PantallaMapaState extends State<PantallaMapa> {
     _subTrack?.cancel();
     _subPosicion?.cancel();
     _subZoomMapa?.cancel();
+    _subTapMapa?.cancel();
+    _temporizadorLongPress?.cancel();
     _mapModel?.dispose();
     super.dispose();
   }
@@ -86,7 +147,7 @@ class _PantallaMapaState extends State<PantallaMapa> {
       await _iniciarInterno();
     } catch (e, st) {
       // Antes un error aquí quedaba silencioso y la app se quedaba en el spinner.
-      debugPrint('OffMaps ERROR al iniciar: $e\n$st');
+      debugPrint('OffMaps ERROR al iniciar: $e\n$st'); // los errores se muestran siempre
       if (mounted) {
         setState(() => _aviso = 'Error cargando el mapa:\n$e');
       }
@@ -94,11 +155,11 @@ class _PantallaMapaState extends State<PantallaMapa> {
   }
 
   Future<void> _iniciarInterno() async {
-    await _cargarAjusteFitZoom();
+    await _cargarAjustesUI();
     _canal.setMethodCallHandler(_enLlamadaNativa);
 
     final permiso = await _canal.invokeMethod<bool>('permisoAlmacenamiento');
-    debugPrint('OffMaps [1] permiso almacenamiento: $permiso');
+    _diag('OffMaps [1] permiso almacenamiento: $permiso');
     if (permiso != true) {
       setState(() => _aviso =
           'Concede "Todos los archivos" a OffMaps y vuelve a abrir la app.');
@@ -107,7 +168,7 @@ class _PantallaMapaState extends State<PantallaMapa> {
     final mapas = (await _canal.invokeMethod<List<dynamic>>('listarMapas'))
             ?.cast<String>() ??
         const <String>[];
-    debugPrint('OffMaps [2] mapas encontrados: $mapas');
+    _diag('OffMaps [2] mapas encontrados: $mapas');
     if (mapas.isEmpty) {
       setState(() => _aviso =
           'Copia un mapa .map (alternativaslibres) en la carpeta OffMaps del almacenamiento.');
@@ -117,25 +178,33 @@ class _PantallaMapaState extends State<PantallaMapa> {
     if (archivo == null) return;
     if (!mounted) return;
 
-    final f = File(archivo);
-    debugPrint('OffMaps [3] archivo: $archivo existe=${await f.exists()} '
-        'bytes=${await f.exists() ? await f.length() : 0}');
+    if (diagnostico) {
+      final f = File(archivo);
+      final existe = await f.exists();
+      _diag('OffMaps [3] archivo: $archivo existe=$existe '
+          'bytes=${existe ? await f.length() : 0}');
 
-    // Diagnóstico de assets del tema: la declaración "assets/render_theme/"
-    // del pubspec NO incluye subcarpetas (symbols, patterns...).
-    final manifiesto = await AssetManifest.loadFromAssetBundle(rootBundle);
-    final assetsTema = manifiesto
-        .listAssets()
-        .where((a) => a.startsWith('assets/render_theme/'))
-        .toList();
-    final carpetas = assetsTema
-        .map((a) => a.split('/').sublist(0, a.split('/').length - 1).join('/'))
-        .toSet();
-    debugPrint('OffMaps [4] assets del tema: ${assetsTema.length} en $carpetas');
+      // La declaración "assets/render_theme/" del pubspec NO incluye subcarpetas;
+      // se listan las carpetas que sí quedaron empaquetadas.
+      final manifiesto = await AssetManifest.loadFromAssetBundle(rootBundle);
+      final assetsTema = manifiesto
+          .listAssets()
+          .where((a) => a.startsWith('assets/render_theme/'))
+          .toList();
+      final carpetas = assetsTema
+          .map((a) => a.split('/').sublist(0, a.split('/').length - 1).join('/'))
+          .toSet();
+      _diag('OffMaps [4] assets del tema: ${assetsTema.length} en $carpetas');
+    }
     if (!mounted) return;
 
-    MapsforgeSettingsMgr()
-        .setDeviceScaleFactor(View.of(context).devicePixelRatio);
+    // Todo lo que necesita BuildContext se lee aquí, justo después de comprobar mounted
+    // y antes de los siguientes await (así no se usa el context tras una espera).
+    final dprReal = View.of(context).devicePixelRatio;
+    final tamPantalla = MediaQuery.sizeOf(context);
+    final dprMapa =
+        (escalaMapaMaxima > 0 && dprReal > escalaMapaMaxima) ? escalaMapaMaxima : dprReal;
+    MapsforgeSettingsMgr().setDeviceScaleFactor(dprMapa);
     SymbolCacheMgr().addLoader(
       'jar:',
       ImageBundleLoader(
@@ -143,22 +212,22 @@ class _PantallaMapaState extends State<PantallaMapa> {
         pathPrefix: 'assets/render_theme/',
       ),
     );
-    final datastore = await Mapfile.createFromFile(filename: archivo);
-    debugPrint('OffMaps [5] datastore creado');
+    final datastore = await IsolateMapfile.createFromFile(filename: archivo);
+    _diag('OffMaps [5] datastore creado');
     final tema = await rootBundle.loadString(temaAsset);
-    debugPrint('OffMaps [6] tema cargado: ${tema.length} caracteres');
+    _diag('OffMaps [6] tema cargado: ${tema.length} caracteres');
     final rendertheme = RenderThemeBuilder.createFromString(tema);
-    // Con Mapfile (no IsolateMapfile) habilitamos lectura/render en isolate
-    // para mejorar rendimiento en zooms con mucha carga visual.
-    final renderer = DatastoreRenderer(datastore, rendertheme, useIsolateReader: true);
+    // IsolateMapfile ya corre lectura en su propio isolate; mantener
+    // useIsolateReader=false evita el problema de objetos no enviables.
+    final rendererBase = DatastoreRenderer(datastore, rendertheme, useIsolateReader: false);
+    // Con diagnóstico se mide cuánto tarda cada tile (líneas "OffMaps TILES").
+    final Renderer renderer = diagnostico ? RendererMedido(rendererBase) : rendererBase;
 
-    final modelo = MapModel(renderer: renderer, zoomlevelRange: const ZoomlevelRange(0, 21));
+    final modelo = MapModel(renderer: renderer, zoomlevelRange: const ZoomlevelRange(zoomMinimo, 21));
     final caja = await datastore.getBoundingBox();
-    final centroLat = (caja.minLatitude + caja.maxLatitude) / 2;
-    final centroLon = (caja.minLongitude + caja.maxLongitude) / 2;
-    debugPrint('OffMaps [7] $archivo cubre lat ${caja.minLatitude}..${caja.maxLatitude}, '
+    _diag('OffMaps [7] $archivo cubre lat ${caja.minLatitude}..${caja.maxLatitude}, '
         'lon ${caja.minLongitude}..${caja.maxLongitude}');
-    modelo.setPosition(MapPosition(centroLat, centroLon, 11));
+    modelo.setPosition(MapPosition(latInicial, lonInicial, zoomInicial));
     _mapModel = modelo;
     _zoomVisual = modelo.lastPosition?.zoomlevel;
 
@@ -166,12 +235,41 @@ class _PantallaMapaState extends State<PantallaMapa> {
     _subZoomMapa = modelo.positionStream.listen((p) {
       if (!mounted) return;
       if (_zoomVisual == p.zoomlevel) return;
+      _diag('OffMaps ZOOM $_zoomVisual -> ${p.zoomlevel}');
       setState(() => _zoomVisual = p.zoomlevel);
     });
 
-    // Pulsación prolongada = crear punto
-    modelo.longTapStream.listen((ev) {
-      if (ev != null) estado.agregarPunto(ev.latitude, ev.longitude);
+    await _subTapMapa?.cancel();
+    _subTapMapa = modelo.tapStream.listen((ev) {
+      if (ev == null) return;
+      final indice = _indicePuntoCercanoTap(ev);
+      if (indice != null) {
+        estado.quitarPunto(indice);
+        _snack('Punto eliminado');
+        return;
+      }
+      if (_tapSobreRuta(ev)) {
+        _abrirTarjetaRuta();
+      }
+    });
+
+    // Solo diagnóstico: coordenada que calcula la librería para la pulsación larga.
+    if (diagnostico) {
+      modelo.longTapStream.listen((ev) {
+        if (ev == null) return;
+        _diag('OffMaps PUNTO(librería) lat=${ev.latitude.toStringAsFixed(6)} '
+            'lon=${ev.longitude.toStringAsFixed(6)} zoom=${modelo.lastPosition?.zoomlevel}');
+      });
+    }
+
+    // Si el usuario manipula el mapa, volver a modo libre para permitir
+    // giros/manual sin que el modo magnético lo fuerce de nuevo.
+    modelo.manualMoveStream.listen((_) {
+      if (!mounted) return;
+      if (_orientacion == ModoOrientacion.libre) return;
+      _subBrujula?.cancel();
+      _subBrujula = null;
+      setState(() => _orientacion = ModoOrientacion.libre);
     });
 
     // Coordenada recibida mientras la app no estaba lista
@@ -179,7 +277,12 @@ class _PantallaMapaState extends State<PantallaMapa> {
         await _canal.invokeMethod<Map<dynamic, dynamic>>('obtenerPendiente');
     if (pendiente != null) _recibirCoordenada(pendiente);
 
-    debugPrint('OffMaps [8] modelo listo');
+    _diag('OffMaps [8] modelo listo');
+    _diag('OffMaps [config] dprReal=${dprReal.toStringAsFixed(2)} '
+        'dprMapa=${MapsforgeSettingsMgr().getDeviceScaleFactor().toStringAsFixed(2)} '
+        'pantalla=${tamPantalla.width.toStringAsFixed(0)}x${tamPantalla.height.toStringAsFixed(0)} dp '
+        '(${(tamPantalla.width * dprReal).round()}x${(tamPantalla.height * dprReal).round()} px) '
+        'tileSize=${MapsforgeSettingsMgr().tileSize} zoomMinimo=$zoomMinimo');
     unawaited(_iniciarIndicadorPosicion());
     setState(() {});
   }
@@ -200,14 +303,26 @@ class _PantallaMapaState extends State<PantallaMapa> {
     await _subPosicion?.cancel();
     _subPosicion = Geolocator.getPositionStream(
       locationSettings: const LocationSettings(
-        accuracy: LocationAccuracy.high,
-        distanceFilter: 2,
+        accuracy: LocationAccuracy.medium,
+        distanceFilter: 8,
       ),
     ).listen((p) {
       if (!mounted) return;
       final rumbo = p.heading;
+      final nuevaPos = LatLong(p.latitude, p.longitude);
+      final anterior = _miPosicion;
+      final dist = anterior == null
+          ? 9999.0
+          : haversineKm(anterior.latitude, anterior.longitude, nuevaPos.latitude, nuevaPos.longitude) *
+              1000;
+      final deltaRumbo = (rumbo.isFinite && rumbo >= 0 && _miRumbo != null)
+          ? (rumbo - _miRumbo!).abs()
+          : 9999.0;
+
+      if (dist < 6 && deltaRumbo < 10) return;
+
       setState(() {
-        _miPosicion = LatLong(p.latitude, p.longitude);
+        _miPosicion = nuevaPos;
         if (rumbo.isFinite && rumbo >= 0) {
           _miRumbo = rumbo;
         }
@@ -272,16 +387,6 @@ class _PantallaMapaState extends State<PantallaMapa> {
     return Geolocator.getCurrentPosition();
   }
 
-  Future<void> _agregarPuntoGps() async {
-    final pos = await _posicionActual();
-    if (pos == null) {
-      _snack('No fue posible obtener la ubicación actual');
-      return;
-    }
-    estado.agregarPunto(pos.latitude, pos.longitude);
-    _mapModel?.moveTo(pos.latitude, pos.longitude);
-  }
-
   Future<void> _trazarRuta() async {
     List<Punto> puntosRuta = List<Punto>.from(estado.puntos);
     if (puntosRuta.length < 2) {
@@ -303,9 +408,9 @@ class _PantallaMapaState extends State<PantallaMapa> {
     }
     estado.setCalculando(true);
     try {
-      final linea = await brouter.calcular(puntosRuta);
+      final linea = await brouter.calcular(puntosRuta, perfil: _perfilRuta);
       estado.setTrazo(linea);
-      _snack('Ruta lista: ${estado.kilometros.toStringAsFixed(1)} km');
+      _snack('Ruta ${_nombrePerfilRuta()}: ${estado.kilometros.toStringAsFixed(1)} km');
     } catch (e) {
       _snack('Error: ${e.toString()}');
     } finally {
@@ -313,9 +418,227 @@ class _PantallaMapaState extends State<PantallaMapa> {
     }
   }
 
+  void _abrirGestionPuntosRuta() {
+    showModalBottomSheet<void>(
+      context: context,
+      builder: (c) => SafeArea(
+        child: ListenableBuilder(
+          listenable: estado,
+          builder: (context, _) {
+            if (estado.puntos.isEmpty) {
+              return const Padding(
+                padding: EdgeInsets.all(24),
+                child: Text('No hay puntos de ruta.'),
+              );
+            }
+            return FractionallySizedBox(
+              heightFactor: 0.72,
+              child: Column(
+                children: [
+                  ListTile(
+                    leading: const Icon(Icons.swap_vert),
+                    title: const Text('Invertir inicio y fin'),
+                    subtitle: const Text('Invierte el orden de todos los puntos'),
+                    onTap: estado.puntos.length < 2
+                        ? null
+                        : () {
+                            estado.invertirPuntos();
+                            _snack('Orden de puntos invertido');
+                          },
+                  ),
+                  const Divider(height: 1),
+                  Expanded(
+                    child: ListView.builder(
+                      itemCount: estado.puntos.length,
+                      itemBuilder: (context, i) {
+                        final p = estado.puntos[i];
+                        final esInicio = i == 0;
+                        final esFin = i == estado.puntos.length - 1;
+                        final titulo = esInicio
+                            ? 'Inicio'
+                            : (esFin ? 'Fin' : 'Paso ${i + 1}');
+                        return ListTile(
+                          leading: Icon(
+                            Icons.circle,
+                            size: 14,
+                            color: esInicio
+                                ? Colors.green
+                                : (esFin ? Colors.red : Colors.orange),
+                          ),
+                          title: Text(titulo),
+                          subtitle: Text(
+                            '${p.lat.toStringAsFixed(6)}, ${p.lon.toStringAsFixed(6)}',
+                          ),
+                          trailing: PopupMenuButton<String>(
+                            onSelected: (v) {
+                              if (v == 'inicio') {
+                                estado.moverPuntoAInicio(i);
+                                _snack('Punto movido a inicio');
+                              } else if (v == 'fin') {
+                                estado.moverPuntoAFin(i);
+                                _snack('Punto movido a fin');
+                              } else if (v == 'eliminar') {
+                                estado.quitarPunto(i);
+                                _snack('Punto eliminado');
+                              }
+                            },
+                            itemBuilder: (context) => [
+                              if (!esInicio)
+                                const PopupMenuItem(
+                                  value: 'inicio',
+                                  child: Text('Poner como inicio'),
+                                ),
+                              if (!esFin)
+                                const PopupMenuItem(
+                                  value: 'fin',
+                                  child: Text('Poner como fin'),
+                                ),
+                              const PopupMenuItem(
+                                value: 'eliminar',
+                                child: Text('Eliminar punto'),
+                              ),
+                            ],
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                ],
+              ),
+            );
+          },
+        ),
+      ),
+    );
+  }
+
+  bool _tapSobreRuta(TapEvent ev) {
+    final ruta = estado.trazo;
+    if (ruta.length < 2) return false;
+    final escala = MapsforgeSettingsMgr().getDeviceScaleFactor();
+    final umbral = math.max(14.0 * escala, (_grosorRuta + 8) * escala);
+    final px = ev.mappoint;
+
+    for (var i = 0; i < ruta.length - 1; i++) {
+      final a = ev.projection.latLonToPixel(ruta[i]);
+      final b = ev.projection.latLonToPixel(ruta[i + 1]);
+      final d = _distanciaPuntoASegmento(px.x, px.y, a.x, a.y, b.x, b.y);
+      if (d <= umbral) return true;
+    }
+    return false;
+  }
+
+  double _distanciaPuntoASegmento(
+    double px,
+    double py,
+    double ax,
+    double ay,
+    double bx,
+    double by,
+  ) {
+    final abx = bx - ax;
+    final aby = by - ay;
+    final apx = px - ax;
+    final apy = py - ay;
+    final ab2 = abx * abx + aby * aby;
+    if (ab2 <= 1e-9) {
+      final dx = px - ax;
+      final dy = py - ay;
+      return math.sqrt(dx * dx + dy * dy);
+    }
+    var t = (apx * abx + apy * aby) / ab2;
+    t = t.clamp(0.0, 1.0);
+    final cx = ax + abx * t;
+    final cy = ay + aby * t;
+    final dx = px - cx;
+    final dy = py - cy;
+    return math.sqrt(dx * dx + dy * dy);
+  }
+
+  void _abrirTarjetaRuta() {
+    if (_panelRutaAbierto || estado.trazo.length < 2) return;
+    _panelRutaAbierto = true;
+    showModalBottomSheet<void>(
+      context: context,
+      builder: (c) => SafeArea(
+        child: StatefulBuilder(
+          builder: (context, setModal) {
+            return FractionallySizedBox(
+              heightFactor: 0.62,
+              child: ListView(
+                children: [
+                  ListTile(
+                    leading: const Icon(Icons.route),
+                    title: Text('Ruta activa (${estado.kilometros.toStringAsFixed(1)} km)'),
+                    subtitle: Text('Perfil: ${_nombrePerfilRuta()}'),
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.swap_vert),
+                    title: const Text('Invertir inicio y fin'),
+                    onTap: () {
+                      estado.invertirPuntos();
+                      Navigator.pop(c);
+                      _snack('Orden de puntos invertido');
+                    },
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.format_list_numbered),
+                    title: const Text('Gestionar puntos de ruta'),
+                    onTap: () {
+                      Navigator.pop(c);
+                      _abrirGestionPuntosRuta();
+                    },
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.refresh),
+                    title: const Text('Re-trazar ruta'),
+                    onTap: () {
+                      Navigator.pop(c);
+                      unawaited(_trazarRuta());
+                    },
+                  ),
+                  const Divider(height: 20),
+                  const ListTile(
+                    leading: Icon(Icons.straighten),
+                    title: Text('Grosor de ruta'),
+                  ),
+                  Slider(
+                    value: _grosorRuta,
+                    min: 0.5,
+                    max: 6.0,
+                    divisions: 55,
+                    label: _grosorRuta.toStringAsFixed(1),
+                    onChanged: (v) {
+                      setState(() => _grosorRuta = v);
+                      setModal(() {});
+                      unawaited(_guardarAjustesUI());
+                    },
+                  ),
+                ],
+              ),
+            );
+          },
+        ),
+      ),
+    ).whenComplete(() {
+      _panelRutaAbierto = false;
+    });
+  }
+
+  String _nombrePerfilRuta() {
+    for (final p in _perfilesRuta) {
+      if (p.id == _perfilRuta) return p.nombre;
+    }
+    return _perfilRuta;
+  }
+
   void _unToqueNorte() {
     _subBrujula?.cancel();
     _subBrujula = null;
+    if (_orientacion == ModoOrientacion.norte) {
+      setState(() => _orientacion = ModoOrientacion.libre);
+      return;
+    }
     setState(() => _orientacion = ModoOrientacion.norte);
     _mapModel?.rotateTo(0);
   }
@@ -329,33 +652,9 @@ class _PantallaMapaState extends State<PantallaMapa> {
     });
   }
 
-  void _compartir(Punto p) {
+  Future<void> _compartir(Punto p) async {
     final texto = '${p.lat.toStringAsFixed(6)}, ${p.lon.toStringAsFixed(6)}';
-    showModalBottomSheet<void>(
-      context: context,
-      builder: (c) => SafeArea(
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          ListTile(
-            leading: const Icon(Icons.share),
-            title: const Text('Compartir coordenadas'),
-            onTap: () async {
-              await SharePlus.instance.share(ShareParams(text: texto));
-              if (c.mounted) Navigator.pop(c);
-            },
-          ),
-          ListTile(
-            leading: const Icon(Icons.map),
-            title: const Text('Abrir en Google Maps'),
-            onTap: () async {
-              final url = Uri.parse(
-                  'https://www.google.com/maps/search/?api=1&query=${p.lat},${p.lon}');
-              await launchUrl(url, mode: LaunchMode.externalApplication);
-              if (c.mounted) Navigator.pop(c);
-            },
-          ),
-        ]),
-      ),
-    );
+    await SharePlus.instance.share(ShareParams(text: texto));
   }
 
   Future<void> _compartirMiUbicacion() async {
@@ -365,7 +664,7 @@ class _PantallaMapaState extends State<PantallaMapa> {
       return;
     }
     final p = Punto(pos.latitude, pos.longitude, 'Mi ubicación');
-    _compartir(p);
+    await _compartir(p);
   }
 
   Future<void> _importarCapa() async {
@@ -769,23 +1068,112 @@ class _PantallaMapaState extends State<PantallaMapa> {
                 onTap: () {
                   setState(() => _ajusteFitZoom = valor);
                   setModal(() {});
-                  unawaited(_guardarAjusteFitZoom());
+                  unawaited(_guardarAjustesUI());
                 },
               );
             }
 
-            return Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const ListTile(
-                  leading: Icon(Icons.tune),
-                  title: Text('Ajuste de zoom al encuadrar'),
-                ),
-                opcion(AjusteFitZoom.cercano, 'Cercano', 'Zoom más alto al abrir capa/track'),
-                opcion(AjusteFitZoom.normal, 'Normal', 'Balance recomendado'),
-                opcion(AjusteFitZoom.amplio, 'Amplio', 'Muestra más contexto alrededor'),
-                const SizedBox(height: 8),
-              ],
+            return FractionallySizedBox(
+              heightFactor: 0.85,
+              child: ListView(
+                shrinkWrap: true,
+                children: [
+                  const ListTile(
+                    leading: Icon(Icons.tune),
+                    title: Text('Ajuste de zoom al encuadrar'),
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.alt_route),
+                    title: const Text('Perfil de enrutamiento'),
+                    subtitle: Text(_nombrePerfilRuta()),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    child: DropdownButtonFormField<String>(
+                      initialValue: _perfilRuta,
+                      decoration: const InputDecoration(
+                        border: OutlineInputBorder(),
+                        isDense: true,
+                      ),
+                      items: _perfilesRuta
+                          .map((p) => DropdownMenuItem(value: p.id, child: Text(p.nombre)))
+                          .toList(growable: false),
+                      onChanged: (v) {
+                        if (v == null) return;
+                        setState(() => _perfilRuta = v);
+                        setModal(() {});
+                        unawaited(_guardarAjustesUI());
+                      },
+                    ),
+                  ),
+                  const Divider(height: 20),
+                  opcion(AjusteFitZoom.cercano, 'Cercano', 'Zoom más alto al abrir capa/track'),
+                  opcion(AjusteFitZoom.normal, 'Normal', 'Balance recomendado'),
+                  opcion(AjusteFitZoom.amplio, 'Amplio', 'Muestra más contexto alrededor'),
+                  const Divider(height: 20),
+                  SwitchListTile(
+                    secondary: const Icon(Icons.label_outline),
+                    title: const Text('Mostrar etiquetas del mapa'),
+                    subtitle: const Text('Desactívalo para mejorar rendimiento'),
+                    value: _mostrarEtiquetas,
+                    onChanged: (v) {
+                      setState(() => _mostrarEtiquetas = v);
+                      setModal(() {});
+                      unawaited(_guardarAjustesUI());
+                    },
+                  ),
+                  const Divider(height: 20),
+                  const ListTile(
+                    leading: Icon(Icons.place_outlined),
+                    title: Text('Tamaño de puntos de referencia'),
+                  ),
+                  Slider(
+                    value: _escalaPuntos,
+                    min: 0.1,
+                    max: 8.0,
+                    divisions: 79,
+                    label: _escalaPuntos.toStringAsFixed(1),
+                    onChanged: (v) {
+                      setState(() => _escalaPuntos = v);
+                      setModal(() {});
+                      unawaited(_guardarAjustesUI());
+                    },
+                  ),
+                  const ListTile(
+                    leading: Icon(Icons.my_location),
+                    title: Text('Tamaño cursor de posición'),
+                  ),
+                  Slider(
+                    value: _escalaPosicion,
+                    min: 1.0,
+                    max: 10.0,
+                    divisions: 36,
+                    label: _escalaPosicion.toStringAsFixed(1),
+                    onChanged: (v) {
+                      setState(() => _escalaPosicion = v);
+                      setModal(() {});
+                      unawaited(_guardarAjustesUI());
+                    },
+                  ),
+                  const ListTile(
+                    leading: Icon(Icons.timeline),
+                    title: Text('Grosor track grabado'),
+                  ),
+                  Slider(
+                    value: _grosorTrack,
+                    min: 0.5,
+                    max: 6.0,
+                    divisions: 55,
+                    label: _grosorTrack.toStringAsFixed(1),
+                    onChanged: (v) {
+                      setState(() => _grosorTrack = v);
+                      setModal(() {});
+                      unawaited(_guardarAjustesUI());
+                    },
+                  ),
+                  const SizedBox(height: 12),
+                ],
+              ),
             );
           },
         ),
@@ -856,7 +1244,7 @@ class _PantallaMapaState extends State<PantallaMapa> {
     }
   }
 
-  Future<void> _cargarAjusteFitZoom() async {
+  Future<void> _cargarAjustesUI() async {
     try {
       final prefs = await SharedPreferences.getInstance();
       final guardado = prefs.getString(_prefAjusteFitZoom);
@@ -864,15 +1252,36 @@ class _PantallaMapaState extends State<PantallaMapa> {
         (v) => v.name == guardado,
         orElse: () => AjusteFitZoom.normal,
       );
+      _escalaPuntos = prefs.getDouble(_prefEscalaPuntos) ?? 1.0;
+      _escalaPosicion = prefs.getDouble(_prefEscalaPosicion) ?? 6.0;
+      _grosorRuta = prefs.getDouble(_prefGrosorRuta) ?? 2.2;
+      _grosorTrack = prefs.getDouble(_prefGrosorTrack) ?? 2.4;
+      _mostrarEtiquetas = prefs.getBool(_prefMostrarEtiquetas) ?? true;
+      _perfilRuta = prefs.getString(_prefPerfilRuta) ?? 'trekking';
+      if (_perfilesRuta.every((p) => p.id != _perfilRuta)) {
+        _perfilRuta = 'trekking';
+      }
     } catch (_) {
       _ajusteFitZoom = AjusteFitZoom.normal;
+      _escalaPuntos = 1.0;
+      _escalaPosicion = 6.0;
+      _grosorRuta = 2.2;
+      _grosorTrack = 2.4;
+      _mostrarEtiquetas = true;
+      _perfilRuta = 'trekking';
     }
   }
 
-  Future<void> _guardarAjusteFitZoom() async {
+  Future<void> _guardarAjustesUI() async {
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString(_prefAjusteFitZoom, _ajusteFitZoom.name);
+      await prefs.setDouble(_prefEscalaPuntos, _escalaPuntos);
+      await prefs.setDouble(_prefEscalaPosicion, _escalaPosicion);
+      await prefs.setDouble(_prefGrosorRuta, _grosorRuta);
+      await prefs.setDouble(_prefGrosorTrack, _grosorTrack);
+      await prefs.setBool(_prefMostrarEtiquetas, _mostrarEtiquetas);
+      await prefs.setString(_prefPerfilRuta, _perfilRuta);
     } catch (_) {
       // Ignorar fallo de persistencia para no bloquear UI.
     }
@@ -895,6 +1304,153 @@ class _PantallaMapaState extends State<PantallaMapa> {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
   }
 
+  List<DefaultHandler> _crearHandlers(MapModel modelo) {
+    const t = 350;
+    return [
+      SingleTapHandler(longPressDuration: t, mapModel: modelo),
+      LongTapHandler(longPressDuration: t, mapModel: modelo),
+      DoubleTapHandler(longPressDuration: t, mapModel: modelo),
+      DragNdropHandler(longPressDuration: t, mapModel: modelo),
+      MoveHandler(longPressDuration: t, mapModel: modelo),
+      RotationHandler(longPressDuration: t, mapModel: modelo, pointerCount: 2, thresholdDeg: 3),
+      ScaleHandler(longPressDuration: t, mapModel: modelo),
+    ];
+  }
+
+  /// Corrige un defecto de mapsforge_flutter 4.1.0: cuando un pellizco termina con un cambio
+  /// de zoom menor a medio nivel, ScaleHandler llama a MapModel.zoomTo(zoomActual), que sale
+  /// sin hacer nada porque el nivel es el mismo. El mapa queda con una escala fraccionaria
+  /// (p. ej. 0.839) y la conversión toque -> coordenada de la librería ignora esa escala,
+  /// así que los puntos caen desplazados respecto al dedo (más cuanto más lejos del centro).
+  /// Al soltar todos los dedos se vuelve a escala 1 (misma posición, rotación y zoom).
+  void _restablecerEscala(MapModel modelo) {
+    // Se espera un instante para que ScaleHandler termine primero su propio cierre.
+    Timer(const Duration(milliseconds: 60), () {
+      if (!mounted || _punterosActivos != 0) return;
+      final pos = modelo.lastPosition;
+      if (pos == null || (pos.scale - 1).abs() < 1e-9) return;
+      _diag('OffMaps ESCALA restablecida ${pos.scale.toStringAsFixed(3)} -> 1 '
+          '(zoom ${pos.zoomlevel})');
+      modelo.setPosition(pos.zoomTo(pos.zoomlevel));
+    });
+  }
+
+  void _cancelarLongPress() {
+    _temporizadorLongPress?.cancel();
+    _temporizadorLongPress = null;
+    _punteroLongPress = null;
+    _inicioLongPress = null;
+  }
+
+  void _programarLongPress({
+    required int puntero,
+    required Offset offset,
+    required Size size,
+    required MapModel modelo,
+  }) {
+    _cancelarLongPress();
+    _punteroLongPress = puntero;
+    _inicioLongPress = offset;
+    _temporizadorLongPress = Timer(const Duration(milliseconds: 350), () {
+      if (!mounted) return;
+      if (_multitouchEnCurso || _punterosActivos != 1) return;
+      final p = _inicioLongPress;
+      if (p == null) return;
+      _agregarPuntoDesdeToque(p, size, modelo);
+      _cancelarLongPress();
+    });
+  }
+
+  /// Convierte un punto de pantalla (dp) en coordenada, con la misma fórmula que usa la librería.
+  LatLong _pantallaACoordenada(MapPosition pos, Offset offset, Size size) {
+    final center = pos.getCenter();
+    final scale = MapsforgeSettingsMgr().getDeviceScaleFactor();
+    var diffX = (offset.dx - size.width / 2) * scale;
+    var diffY = (offset.dy - size.height / 2) * scale;
+
+    if (pos.rotation != 0) {
+      final hyp = math.sqrt(diffX * diffX + diffY * diffY);
+      final rad = math.atan2(diffY, diffX);
+      final rot = pos.rotationRadian;
+      diffX = math.cos(-rot + rad) * hyp;
+      diffY = math.sin(-rot + rad) * hyp;
+    }
+
+    final ll = pos.projection.pixelToLatLong(center.x + diffX, center.y + diffY);
+    return LatLong(ll.latitude, ll.longitude);
+  }
+
+  void _agregarPuntoDesdeToque(Offset offset, Size size, MapModel modelo) {
+    final ahora = modelo.lastPosition;
+    if (ahora == null) return;
+
+    final alTocar = _posAlTocar;
+    final offsetAlTocar = _offsetAlTocar;
+    final llAhora = _pantallaACoordenada(ahora, offset, size);
+    LatLong? llAlTocar;
+    if (alTocar != null && offsetAlTocar != null) {
+      llAlTocar = _pantallaACoordenada(alTocar, offsetAlTocar, size);
+    }
+
+    // ---- diagnóstico: ¿se movió el mapa entre poner el dedo y cumplirse la pulsación?
+    if (diagnostico) {
+      final dpr = MapsforgeSettingsMgr().getDeviceScaleFactor();
+      String movimiento = 'sin dato';
+      if (alTocar != null) {
+        if (alTocar.zoomlevel != ahora.zoomlevel) {
+          movimiento = 'zoom distinto (${alTocar.zoomlevel} -> ${ahora.zoomlevel})';
+        } else {
+          final c0 = alTocar.getCenter();
+          final c1 = ahora.getCenter();
+          final dx = c1.x - c0.x;
+          final dy = c1.y - c0.y;
+          movimiento = '${(math.sqrt(dx * dx + dy * dy) / dpr).toStringAsFixed(1)} px, '
+              'giro ${(ahora.rotation - alTocar.rotation).toStringAsFixed(1)}°';
+        }
+      }
+      final difMetros = llAlTocar == null
+          ? null
+          : haversineKm(llAhora.latitude, llAhora.longitude, llAlTocar.latitude, llAlTocar.longitude) * 1000;
+      final pantalla = MediaQuery.sizeOf(context);
+      _diag('OffMaps PUNTO zoom=${ahora.zoomlevel} scale=${ahora.scale.toStringAsFixed(3)} '
+          'rot=${ahora.rotation.toStringAsFixed(1)} modo=$_orientacion dpr=${dpr.toStringAsFixed(2)} '
+          'tamanoStack=${size.width.toStringAsFixed(0)}x${size.height.toStringAsFixed(0)} '
+          'tamanoPantalla=${pantalla.width.toStringAsFixed(0)}x${pantalla.height.toStringAsFixed(0)} '
+          'dedo=(${offset.dx.toStringAsFixed(0)},${offset.dy.toStringAsFixed(0)}) '
+          'mapaSeMovio=$movimiento '
+          'difAhoraVsAlTocar=${difMetros?.toStringAsFixed(1) ?? "?"} m '
+          'ahora=(${llAhora.latitude.toStringAsFixed(6)},${llAhora.longitude.toStringAsFixed(6)}) '
+          'alTocar=(${llAlTocar?.latitude.toStringAsFixed(6) ?? "?"},${llAlTocar?.longitude.toStringAsFixed(6) ?? "?"}) '
+          'usado=${puntoConPosicionAlTocar && llAlTocar != null ? "alTocar" : "ahora"}');
+    }
+
+    final ll = (puntoConPosicionAlTocar && llAlTocar != null) ? llAlTocar : llAhora;
+    estado.agregarPunto(ll.latitude, ll.longitude);
+  }
+
+  int? _indicePuntoCercanoTap(TapEvent ev) {
+    if (estado.puntos.isEmpty) return null;
+    final escala = MapsforgeSettingsMgr().getDeviceScaleFactor();
+    final umbral = 24.0 * escala;
+    var mejorIndice = -1;
+    var mejorDist = double.infinity;
+
+    for (var i = 0; i < estado.puntos.length; i++) {
+      final p = estado.puntos[i];
+      final px = ev.projection.latLonToPixel(LatLong(p.lat, p.lon));
+      final dx = px.x - ev.mappoint.x;
+      final dy = px.y - ev.mappoint.y;
+      final d = math.sqrt(dx * dx + dy * dy);
+      if (d < mejorDist) {
+        mejorDist = d;
+        mejorIndice = i;
+      }
+    }
+
+    if (mejorIndice < 0 || mejorDist > umbral) return null;
+    return mejorIndice;
+  }
+
   // ------------------------------------------------------------------- build
 
   @override
@@ -908,25 +1464,74 @@ class _PantallaMapaState extends State<PantallaMapa> {
               ? const Center(child: CircularProgressIndicator())
               : ListenableBuilder(
                   listenable: estado,
-                  builder: (context, _) => Stack(
-                    children: [
-                      // gestos: un toque, doble toque, pulsación larga, mover, zoom, rotar
-                      GenericGestureDetector(mapModel: modelo),
-                      ...modelo.renderers
-                          .map((r) => TileView(mapModel: modelo, renderer: r)),
-                      if (zoomActual >= 15)
-                        ...modelo.labelRenderers
-                            .map((r) => LabelView(mapModel: modelo, renderer: r)),
-                      MarkerDatastoreOverlay(
-                        mapModel: modelo,
-                        datastore: _construirMarcadores(),
-                        zoomlevelRange: ZoomlevelRange.standard(),
-                      ),
-                      if (zoomActual >= 13) DistanceOverlay(mapModel: modelo),
-                      _badgeTrack(),
-                      _panelInferior(),
-                      _botonesLaterales(modelo),
-                    ],
+                  builder: (context, _) => LayoutBuilder(
+                    builder: (context, constraints) => Stack(
+                      children: [
+                        // gestos: un toque, doble toque, pulsación larga, mover, zoom, rotar
+                        GenericGestureDetector(
+                          mapModel: modelo,
+                          handlers: _crearHandlers(modelo),
+                        ),
+                        Positioned.fill(
+                          child: Listener(
+                            behavior: HitTestBehavior.translucent,
+                            onPointerDown: (e) {
+                              if (_punterosActivos == 0) {
+                                _posAlTocar = modelo.lastPosition;
+                                _offsetAlTocar = e.localPosition;
+                              }
+                              _punterosActivos++;
+                              if (_punterosActivos > 1) {
+                                _multitouchEnCurso = true;
+                                _cancelarLongPress();
+                              } else {
+                                _programarLongPress(
+                                  puntero: e.pointer,
+                                  offset: e.localPosition,
+                                  size: constraints.biggest,
+                                  modelo: modelo,
+                                );
+                              }
+                            },
+                            onPointerMove: (e) {
+                              if (_punteroLongPress != e.pointer || _inicioLongPress == null) return;
+                              final d = e.localPosition - _inicioLongPress!;
+                              if (d.distance > 18) _cancelarLongPress();
+                            },
+                            onPointerUp: (e) {
+                              if (_punteroLongPress == e.pointer) _cancelarLongPress();
+                              if (_punterosActivos > 0) _punterosActivos--;
+                              if (_punterosActivos == 0) {
+                                _multitouchEnCurso = false;
+                                _restablecerEscala(modelo);
+                              }
+                            },
+                            onPointerCancel: (e) {
+                              if (_punteroLongPress == e.pointer) _cancelarLongPress();
+                              if (_punterosActivos > 0) _punterosActivos--;
+                              if (_punterosActivos == 0) {
+                                _multitouchEnCurso = false;
+                                _restablecerEscala(modelo);
+                              }
+                            },
+                            child: const SizedBox.expand(),
+                          ),
+                        ),
+                        ...modelo.renderers
+                            .map((r) => TileView(mapModel: modelo, renderer: r)),
+                        if (_mostrarEtiquetas && zoomActual >= 16)
+                          ...modelo.labelRenderers
+                              .map((r) => LabelView(mapModel: modelo, renderer: r)),
+                        MarkerDatastoreOverlay(
+                          mapModel: modelo,
+                          datastore: _construirMarcadores(),
+                          zoomlevelRange: ZoomlevelRange.standard(),
+                        ),
+                        if (zoomActual >= 14) DistanceOverlay(mapModel: modelo),
+                        _badgeTrack(),
+                        _botonesLaterales(modelo),
+                      ],
+                    ),
                   ),
                 ),
     );
@@ -960,12 +1565,11 @@ class _PantallaMapaState extends State<PantallaMapa> {
 
     if (_miPosicion != null) {
       final p = _miPosicion!;
-      ds.addMarker(CircleMarker(
+      ds.addMarker(IconMarker(
         latLong: p,
-        radius: _radioPunto(zoom, base: 2.2, maximo: 4.2),
-        fillColor: 0xFF1E88E5,
-        strokeColor: 0xFFFFFFFF,
-        strokeWidth: 1.2,
+        iconData: Icons.my_location_rounded,
+        size: _tamIconoPosicion(zoom),
+        bitmapColor: 0xFF1976D2,
       ));
 
       final rumbo = _miRumbo;
@@ -1002,49 +1606,55 @@ class _PantallaMapaState extends State<PantallaMapa> {
     for (var i = 0; i < estado.puntos.length; i++) {
       final p = estado.puntos[i];
       final esInicio = i == 0;
-      final esFin = i == estado.puntos.length - 1 && estado.puntos.length > 1;
+      final esFin = i == estado.puntos.length - 1;
+      final color = esInicio
+          ? 0xFF2E7D32
+          : (esFin ? 0xFFD32F2F : 0xFFFF8F00);
       ds.addMarker(CircleMarker(
         latLong: LatLong(p.lat, p.lon),
-        radius: _radioPunto(
-          zoom,
-          base: esInicio || esFin ? 1.8 : 1.6,
-          maximo: esInicio || esFin ? 3.2 : 2.8,
-        ),
-        fillColor: esInicio
-            ? 0xCC0B7A3E
-            : (esFin ? 0xCCB00020 : 0xCC1565C0),
-        strokeColor: 0xFFFFFFFF,
-        strokeWidth: 1,
+        radius: _tamIconoPunto(zoom, base: 24, maximo: 34) * 0.35,
+        fillColor: color,
+        strokeColor: 0x66FFFFFF,
+        strokeWidth: 0.8,
       ));
     }
     if (estado.trazo.length > 1) {
       ds.addMarker(PolylineMarker(
         path: List<LatLong>.from(estado.trazo),
-        strokeWidth: 6,
+        strokeWidth: _grosorRuta,
         strokeColor: 0xFF0B7A3E,
       ));
     }
     if (estado.trackActual.length > 1) {
       ds.addMarker(PolylineMarker(
         path: List<LatLong>.from(estado.trackActual),
-        strokeWidth: 5,
+        strokeWidth: _grosorTrack,
         strokeColor: estado.trackEnPausa ? 0xFFFFA000 : 0xFFD32F2F,
       ));
     }
     return ds;
   }
 
-  double _radioPunto(int zoom, {required double base, required double maximo}) {
+  double _tamIconoPunto(int zoom, {required double base, required double maximo}) {
     final t = ((15 - zoom) / 8).clamp(0.0, 1.0);
-    return base + (maximo - base) * t;
+    return (base + (maximo - base) * t) * _escalaPuntos;
+  }
+
+  double _tamIconoPosicion(int zoom) {
+    if (zoom >= 19) return 10 * _escalaPosicion;
+    if (zoom >= 17) return 11 * _escalaPosicion;
+    if (zoom >= 15) return 12 * _escalaPosicion;
+    if (zoom >= 13) return 14 * _escalaPosicion;
+    return 16 * _escalaPosicion;
   }
 
   double _tamIconoRumbo(int zoom) {
-    if (zoom >= 19) return 10;
-    if (zoom >= 17) return 12;
-    if (zoom >= 15) return 14;
-    if (zoom >= 13) return 16;
-    return 18;
+    final f = (_escalaPosicion / 6.0).clamp(0.4, 2.0);
+    if (zoom >= 19) return 13 * f;
+    if (zoom >= 17) return 15 * f;
+    if (zoom >= 15) return 17 * f;
+    if (zoom >= 13) return 20 * f;
+    return 24 * f;
   }
 
   Widget _botonesLaterales(MapModel modelo) => Positioned(
@@ -1070,13 +1680,8 @@ class _PantallaMapaState extends State<PantallaMapa> {
             ),
             const SizedBox(height: 12),
             _BotonIcono(
-              icono: _importando ? Icons.hourglass_top : Icons.file_open_outlined,
+              icono: _importando ? Icons.hourglass_top : Icons.layers,
               onTap: _importando ? null : _importarCapa,
-            ),
-            const SizedBox(height: 12),
-            _BotonIcono(
-              icono: Icons.add_location_alt_outlined,
-              onTap: _agregarPuntoGps,
             ),
             const SizedBox(height: 12),
             _BotonIcono(
@@ -1095,15 +1700,15 @@ class _PantallaMapaState extends State<PantallaMapa> {
             ),
             const SizedBox(height: 12),
             // Compartir último punto
-            if (estado.puntos.isNotEmpty)
-              _BotonIcono(
-                icono: Icons.share,
-                onTap: () => _compartir(estado.puntos.last),
-              ),
-            const SizedBox(height: 12),
             _BotonIcono(
-              icono: Icons.near_me_outlined,
-              onTap: _compartirMiUbicacion,
+              icono: Icons.share,
+              onTap: () {
+                if (estado.puntos.isNotEmpty) {
+                  unawaited(_compartir(estado.puntos.last));
+                } else {
+                  unawaited(_compartirMiUbicacion());
+                }
+              },
             ),
             const SizedBox(height: 12),
             if (estado.capasExternas.isNotEmpty)
@@ -1113,6 +1718,11 @@ class _PantallaMapaState extends State<PantallaMapa> {
               ),
             if (estado.capasExternas.isNotEmpty)
               const SizedBox(height: 12),
+            _BotonIcono(
+              icono: estado.calculando ? Icons.hourglass_top : Icons.route,
+              onTap: estado.calculando ? null : _trazarRuta,
+            ),
+            const SizedBox(height: 12),
             _BotonIcono(
               icono: Icons.delete_outline,
               onTap: estado.puntos.isEmpty ? null : estado.limpiar,
@@ -1147,29 +1757,6 @@ class _PantallaMapaState extends State<PantallaMapa> {
     );
   }
 
-  Widget _panelInferior() => Positioned(
-        left: 0,
-        right: 0,
-        bottom: 24,
-        child: Center(
-          child: FilledButton.tonalIcon(
-            onPressed: estado.calculando ? null : _trazarRuta,
-            icon: estado.calculando
-                ? const SizedBox(
-                    width: 16,
-                    height: 16,
-                    child: CircularProgressIndicator(strokeWidth: 2))
-                : const Icon(Icons.route),
-            label: Text(estado.puntos.length < 2
-                ? (estado.puntos.length == 1
-                    ? 'Trazar desde mi ubicación'
-                    : 'Toca prolongado para agregar puntos')
-                : estado.trazo.isEmpty
-                    ? 'Trazar ruta (${estado.puntos.length} puntos)'
-                    : '${estado.kilometros.toStringAsFixed(1)} km · re-trazar'),
-          ),
-        ),
-      );
 }
 
 class _BotonIcono extends StatelessWidget {

@@ -62,6 +62,26 @@ class EstadoMapa extends ChangeNotifier {
     }
   }
 
+  void invertirPuntos() {
+    if (puntos.length < 2) return;
+    puntos.replaceRange(0, puntos.length, puntos.reversed);
+    notifyListeners();
+  }
+
+  void moverPuntoAInicio(int indice) {
+    if (indice <= 0 || indice >= puntos.length) return;
+    final p = puntos.removeAt(indice);
+    puntos.insert(0, p);
+    notifyListeners();
+  }
+
+  void moverPuntoAFin(int indice) {
+    if (indice < 0 || indice >= puntos.length - 1) return;
+    final p = puntos.removeAt(indice);
+    puntos.add(p);
+    notifyListeners();
+  }
+
   void limpiar() {
     puntos.clear();
     trazo = const [];
